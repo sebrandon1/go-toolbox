@@ -29,12 +29,23 @@ type HTTPConfig struct {
 	BaseDelay time.Duration
 	// MaxDelay caps local backoff and any server-supplied Retry-After.
 	MaxDelay time.Duration
-	// RetryMethods lists methods eligible for retry. Defaults to idempotent
-	// methods: GET, HEAD, PUT, DELETE, OPTIONS.
+	// RetryMethods lists methods eligible for retry on a retryable status.
+	// Defaults to idempotent methods: GET, HEAD, PUT, DELETE, OPTIONS.
 	RetryMethods map[string]bool
+	// TransportRetryMethods lists methods whose transport errors are retried.
+	// Defaults to RetryMethods. Set it separately when a caller needs to retry
+	// connection failures for non-idempotent methods without retrying their
+	// status responses.
+	TransportRetryMethods map[string]bool
 	// RetryStatus reports whether a status code is retryable. Defaults to
 	// 429, 500, 502, 503 and 504.
 	RetryStatus func(int) bool
+	// RetryTransport reports whether a transport error is retryable. Defaults
+	// to all errors except context cancellation, which is never retried.
+	RetryTransport func(error) bool
+	// IgnoreRetryAfter disables honouring the Retry-After header, so only
+	// local backoff is used.
+	IgnoreRetryAfter bool
 	// Jitter transforms a backoff delay before sleeping. Defaults to full
 	// jitter in [d/2, d].
 	Jitter func(time.Duration) time.Duration
@@ -65,14 +76,37 @@ func WithHTTPMaxDelay(d time.Duration) HTTPOption {
 	return func(c *HTTPConfig) { c.MaxDelay = d }
 }
 
-// WithRetryMethods replaces the set of methods eligible for retry.
+// WithRetryMethods replaces the set of methods eligible for status retries.
 func WithRetryMethods(methods ...string) HTTPOption {
 	return func(c *HTTPConfig) {
-		c.RetryMethods = make(map[string]bool, len(methods))
-		for _, m := range methods {
-			c.RetryMethods[m] = true
-		}
+		c.RetryMethods = methodSet(methods)
 	}
+}
+
+// WithTransportRetryMethods replaces the set of methods whose transport errors
+// are retried. It defaults to RetryMethods.
+func WithTransportRetryMethods(methods ...string) HTTPOption {
+	return func(c *HTTPConfig) {
+		c.TransportRetryMethods = methodSet(methods)
+	}
+}
+
+// WithRetryTransport replaces the transport-error predicate.
+func WithRetryTransport(fn func(error) bool) HTTPOption {
+	return func(c *HTTPConfig) { c.RetryTransport = fn }
+}
+
+// WithoutRetryAfter ignores any Retry-After header and uses local backoff.
+func WithoutRetryAfter() HTTPOption {
+	return func(c *HTTPConfig) { c.IgnoreRetryAfter = true }
+}
+
+func methodSet(methods []string) map[string]bool {
+	set := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		set[m] = true
+	}
+	return set
 }
 
 // WithRetryStatus replaces the retryable-status predicate.
@@ -159,15 +193,22 @@ func Do(ctx context.Context, client *http.Client, req *http.Request, opts ...HTT
 	if cfg.RetryStatus == nil {
 		cfg.RetryStatus = DefaultRetryStatus
 	}
+	if cfg.TransportRetryMethods == nil {
+		cfg.TransportRetryMethods = cfg.RetryMethods
+	}
+	if cfg.RetryTransport == nil {
+		cfg.RetryTransport = func(error) bool { return true }
+	}
 
 	body, err := bufferBody(req)
 	if err != nil {
 		return nil, err
 	}
 
-	retryable := cfg.RetryMethods[req.Method]
+	statusRetryable := cfg.RetryMethods[req.Method]
+	transportRetryable := cfg.TransportRetryMethods[req.Method]
 	attempts := 1
-	if retryable {
+	if statusRetryable || transportRetryable {
 		attempts = cfg.MaxAttempts
 	}
 
@@ -196,19 +237,22 @@ func Do(ctx context.Context, client *http.Client, req *http.Request, opts ...HTT
 				return nil, ctx.Err()
 			}
 			lastErr = &httpx.NetworkError{Cause: doErr}
-			if attempt == attempts-1 {
+			if !transportRetryable || !cfg.RetryTransport(doErr) || attempt == attempts-1 {
 				return nil, lastErr
 			}
 			pendingWait = cfg.Jitter(backoff(cfg.BaseDelay, cfg.MaxDelay, attempt+1))
-			notify(cfg, attempt, lastErr, pendingWait)
+			notify(&cfg, attempt, lastErr, pendingWait)
 			continue
 		}
 
-		if !retryable || !cfg.RetryStatus(resp.StatusCode) {
+		if !statusRetryable || !cfg.RetryStatus(resp.StatusCode) {
 			return resp, nil
 		}
 
-		wait := httpx.ParseRetryAfter(resp.Header.Get("Retry-After"))
+		wait, hasRetryAfter := httpx.ParseRetryAfterOK(resp.Header.Get("Retry-After"))
+		if cfg.IgnoreRetryAfter {
+			wait, hasRetryAfter = 0, false
+		}
 		errBody := httpx.ReadErrorBody(resp.Body, httpx.DefaultMaxErrorBodyBytes)
 		resp.Body.Close() //nolint:errcheck // drained and converted to an error
 		lastErr = statusError(resp.StatusCode, errBody, wait)
@@ -216,20 +260,19 @@ func Do(ctx context.Context, client *http.Client, req *http.Request, opts ...HTT
 		if attempt == attempts-1 {
 			return nil, lastErr
 		}
-		pendingWait = wait
-		if pendingWait > cfg.MaxDelay {
-			pendingWait = cfg.MaxDelay
-		}
-		if pendingWait <= 0 {
+		if hasRetryAfter {
+			// An explicit Retry-After, including "0", overrides local backoff.
+			pendingWait = min(wait, cfg.MaxDelay)
+		} else {
 			pendingWait = cfg.Jitter(backoff(cfg.BaseDelay, cfg.MaxDelay, attempt+1))
 		}
-		notify(cfg, attempt, lastErr, pendingWait)
+		notify(&cfg, attempt, lastErr, pendingWait)
 	}
 
 	return nil, lastErr
 }
 
-func notify(cfg HTTPConfig, attempt int, err error, delay time.Duration) {
+func notify(cfg *HTTPConfig, attempt int, err error, delay time.Duration) {
 	if cfg.OnRetry != nil {
 		cfg.OnRetry(attempt, err, delay)
 	}

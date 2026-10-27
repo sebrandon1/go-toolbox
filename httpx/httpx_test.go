@@ -37,6 +37,33 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfterOK(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		header string
+		want   time.Duration
+		ok     bool
+	}{
+		{"", 0, false},
+		{"0", 0, true},
+		{"5", 5 * time.Second, true},
+		{"-1", 0, false},
+		{"garbage", 0, false},
+		{now.Add(-time.Minute).Format(http.TimeFormat), 0, true},
+		{now.Add(time.Minute).Format(http.TimeFormat), time.Minute, true},
+	}
+	for _, tc := range cases {
+		got, ok := parseRetryAfterAt(tc.header, now)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("parseRetryAfterAt(%q) = %v,%v want %v,%v", tc.header, got, ok, tc.want, tc.ok)
+		}
+	}
+	// ParseRetryAfterOK uses the wall clock; just check the ok flag for "0".
+	if d, ok := ParseRetryAfterOK("0"); d != 0 || !ok {
+		t.Fatalf("ParseRetryAfterOK(0) = %v,%v", d, ok)
+	}
+}
+
 func TestCheckStatus(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/widgets/42", nil)
 	cases := []struct {

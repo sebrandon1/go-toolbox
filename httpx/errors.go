@@ -190,33 +190,46 @@ func singularize(s string) string {
 
 // ParseRetryAfter parses an HTTP Retry-After header value per RFC 9110: either
 // delta-seconds (integer) or an HTTP-date. It returns 0 on parse failure, for
-// a non-positive value, or when an HTTP-date is already in the past.
+// a negative value, or when an HTTP-date is already in the past.
 func ParseRetryAfter(header string) time.Duration {
-	return ParseRetryAfterAt(header, time.Now())
+	d, _ := ParseRetryAfterOK(header)
+	return d
+}
+
+// ParseRetryAfterOK is ParseRetryAfter with a report of whether the header
+// carried a valid value. A valid "0" returns (0, true), which lets a retry
+// loop distinguish "server said retry immediately" from "no header".
+func ParseRetryAfterOK(header string) (time.Duration, bool) {
+	return parseRetryAfterAt(header, time.Now())
 }
 
 // ParseRetryAfterAt is ParseRetryAfter with an explicit "now", for tests and
 // deterministic callers.
 func ParseRetryAfterAt(header string, now time.Time) time.Duration {
+	d, _ := parseRetryAfterAt(header, now)
+	return d
+}
+
+func parseRetryAfterAt(header string, now time.Time) (time.Duration, bool) {
 	header = strings.TrimSpace(header)
 	if header == "" {
-		return 0
+		return 0, false
 	}
 	// Prefer delta-seconds when the whole value is a non-negative integer.
 	if secs, err := strconv.Atoi(header); err == nil {
-		if secs <= 0 {
-			return 0
+		if secs < 0 {
+			return 0, false
 		}
-		return time.Duration(secs) * time.Second
+		return time.Duration(secs) * time.Second, true
 	}
 	// HTTP-date form (for example "Thu, 10 Jul 2026 15:04:05 GMT").
 	t, err := http.ParseTime(header)
 	if err != nil {
-		return 0
+		return 0, false
 	}
 	d := t.Sub(now)
 	if d <= 0 {
-		return 0
+		return 0, true
 	}
-	return d
+	return d, true
 }
